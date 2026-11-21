@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+from collections import OrderedDict
 from collections.abc import Iterable
 from typing import ClassVar, TypedDict
 
@@ -37,6 +38,7 @@ PATCH_SIZE = 32
 TIMESTEP_TOKEN_NUM = 1
 NOISE_SCALE = 8.0
 T_EPS = 0.001
+TEXT_SAMPLE_CACHE_CAPACITY = 128
 
 # upstream: HiDream-O1-Image models/utils.py L7-19 @21bcd30471ac
 PREDEFINED_RESOLUTIONS: tuple[tuple[int, int], ...] = (
@@ -444,6 +446,9 @@ class HiDreamO1ImagePipeline(nn.Module, DiffusionPipelineProfilerMixin, Progress
         self.model_dir = od_config.model
         self.dtype = od_config.dtype if od_config.dtype is not None else torch.bfloat16
         self.device = get_local_device()
+        self._text_sample_cache: OrderedDict[tuple[object, ...], HiDreamO1TextSample] = OrderedDict()
+        self._text_sample_cache_hits = 0
+        self._text_sample_cache_misses = 0
         self.weights_sources = [
             DiffusersPipelineLoader.ComponentSource(
                 model_or_path=od_config.model,
@@ -702,6 +707,27 @@ class HiDreamO1ImagePipeline(nn.Module, DiffusionPipelineProfilerMixin, Progress
         width: int,
         expected_image_len: int,
     ) -> HiDreamO1TextSample:
+        cache_key = (
+            str(self.model_dir),
+            str(getattr(self.od_config, "revision", None)),
+            str(prompt),
+            int(height),
+            int(width),
+            int(expected_image_len),
+            str(self.dtype),
+            bool(self.model.supports_piecewise_attention),
+        )
+        cached = getattr(self, "_text_sample_cache", None)
+        if cached is not None:
+            try:
+                sample = cached.pop(cache_key)
+            except KeyError:
+                self._text_sample_cache_misses += 1
+            else:
+                cached[cache_key] = sample
+                self._text_sample_cache_hits += 1
+                return sample
+
         sample = build_t2i_text_sample(
             prompt=prompt,
             height=height,
@@ -723,12 +749,26 @@ class HiDreamO1ImagePipeline(nn.Module, DiffusionPipelineProfilerMixin, Progress
                 inputs["token_types"],
                 dtype=self.dtype,
             )
-        return {
+        text_sample: HiDreamO1TextSample = {
             "input_ids": inputs["input_ids"],
             "position_ids": inputs["position_ids"],
             "attention_mask": attention_mask,
             "full_attn_spans": full_attn_spans,
             "vinput_mask": inputs["vinput_mask"],
+        }
+        if cached is not None:
+            cached[cache_key] = text_sample
+            while len(cached) > TEXT_SAMPLE_CACHE_CAPACITY:
+                cached.popitem(last=False)
+        return text_sample
+
+    def get_text_sample_cache_stats(self) -> dict[str, int]:
+        cached = getattr(self, "_text_sample_cache", None)
+        return {
+            "hits": int(getattr(self, "_text_sample_cache_hits", 0)),
+            "misses": int(getattr(self, "_text_sample_cache_misses", 0)),
+            "entries": len(cached) if cached is not None else 0,
+            "capacity": TEXT_SAMPLE_CACHE_CAPACITY,
         }
 
     @torch.inference_mode()

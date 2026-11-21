@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from collections import OrderedDict
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -142,3 +143,66 @@ def test_hidream_cfg_batch_runs_one_forward_and_splits_outputs():
     ]
     assert cond_output.shape == (1, 2, 3)
     assert uncond_output.shape == (1, 2, 3)
+
+
+def test_hidream_text_sample_cache_reuses_matching_static_sample():
+    pipeline = HiDreamO1ImagePipeline.__new__(HiDreamO1ImagePipeline)
+    pipeline.od_config = SimpleNamespace(revision="test-revision")
+    pipeline.model_dir = "test/model"
+    pipeline.dtype = torch.float32
+    pipeline.device = torch.device("cpu")
+    pipeline.model = SimpleNamespace(
+        config=SimpleNamespace(),
+        supports_piecewise_attention=True,
+    )
+    pipeline.tokenizer = object()
+    pipeline.processor = object()
+    pipeline._text_sample_cache = OrderedDict()
+    pipeline._text_sample_cache_hits = 0
+    pipeline._text_sample_cache_misses = 0
+
+    build_calls = 0
+
+    def mock_build_t2i_text_sample(**_kwargs):
+        nonlocal build_calls
+        build_calls += 1
+        return {
+            "input_ids": torch.zeros((1, 2), dtype=torch.long),
+            "position_ids": torch.zeros((3, 1, 4), dtype=torch.long),
+            "attention_mask": None,
+            "full_attn_spans": [[(2, 4)]],
+            "vinput_mask": torch.tensor([[False, False, True, True]]),
+            "token_types": torch.tensor([[0, 0, 1, 1]]),
+        }
+
+    with (
+        patch(
+            "vllm_omni.diffusion.models.hidream_o1_image.pipeline_hidream_o1_image.build_t2i_text_sample",
+            side_effect=mock_build_t2i_text_sample,
+        ),
+        patch(
+            "vllm_omni.diffusion.models.hidream_o1_image.pipeline_hidream_o1_image.build_hidream_o1_full_attn_spans",
+            return_value=[[(2, 4)]],
+        ),
+    ):
+        first = pipeline._build_and_validate_sample(
+            "same prompt",
+            64,
+            64,
+            4,
+        )
+        second = pipeline._build_and_validate_sample(
+            "same prompt",
+            64,
+            64,
+            4,
+        )
+
+    assert first is second
+    assert build_calls == 1
+    assert pipeline.get_text_sample_cache_stats() == {
+        "hits": 1,
+        "misses": 1,
+        "entries": 1,
+        "capacity": 128,
+    }
