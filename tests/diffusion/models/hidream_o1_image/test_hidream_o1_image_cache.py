@@ -5,6 +5,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
+import torch
 from cache_dit import ForwardPattern
 from torch import nn
 
@@ -65,3 +66,79 @@ def test_cache_dit_targets_the_decoder_module_that_owns_layers():
         num_inference_steps=50,
         verbose=True,
     )
+
+
+class _MockImageModel:
+    def __init__(self) -> None:
+        self.call_count = 0
+        self.last_kwargs = None
+
+    def __call__(self, **kwargs):
+        self.call_count += 1
+        self.last_kwargs = kwargs
+        batch_size = kwargs["input_ids"].shape[0]
+        seq_len = kwargs["position_ids"].shape[-1]
+        patch_dim = kwargs["vinputs"].shape[-1]
+        return SimpleNamespace(
+            x_pred=torch.zeros(
+                batch_size,
+                seq_len,
+                patch_dim,
+                dtype=torch.float32,
+            )
+        )
+
+
+def _cfg_sample(*, seq_len: int = 4, patch_dim: int = 3):
+    return {
+        "input_ids": torch.zeros((1, seq_len - 2), dtype=torch.long),
+        "position_ids": torch.zeros((3, 1, seq_len), dtype=torch.long),
+        "attention_mask": torch.zeros((1, 1, seq_len, seq_len), dtype=torch.float32),
+        "full_attn_spans": [[(seq_len - 2, seq_len)]],
+        "vinput_mask": torch.tensor([[False, False, True, True]]),
+    }
+
+
+def test_hidream_cfg_samples_can_batch_only_with_matching_shapes():
+    cond_sample = _cfg_sample()
+    uncond_sample = _cfg_sample()
+    assert HiDreamO1ImagePipeline._cfg_samples_can_batch(cond_sample, uncond_sample)
+
+    mismatch = _cfg_sample(seq_len=5)
+    mismatch["input_ids"] = torch.zeros((1, 3), dtype=torch.long)
+    mismatch["position_ids"] = torch.zeros((3, 1, 5), dtype=torch.long)
+    mismatch["attention_mask"] = torch.zeros((1, 1, 5, 5), dtype=torch.float32)
+    mismatch["vinput_mask"] = torch.tensor([[False, False, True, True, True]])
+    assert not HiDreamO1ImagePipeline._cfg_samples_can_batch(cond_sample, mismatch)
+
+
+def test_hidream_cfg_batch_runs_one_forward_and_splits_outputs():
+    pipeline = HiDreamO1ImagePipeline.__new__(HiDreamO1ImagePipeline)
+    pipeline.device = torch.device("cpu")
+    pipeline.dtype = torch.float32
+    pipeline.model = _MockImageModel()
+
+    cond_sample = _cfg_sample()
+    uncond_sample = _cfg_sample()
+    z_in = torch.zeros((1, 2, 3), dtype=torch.float32)
+    timestep = torch.tensor([0.25], dtype=torch.float32)
+
+    cond_output, uncond_output = pipeline._forward_cfg_batch(
+        cond_sample,
+        uncond_sample,
+        z_in,
+        timestep,
+    )
+
+    assert pipeline.model.call_count == 1
+    assert pipeline.model.last_kwargs["input_ids"].shape == (2, 2)
+    assert pipeline.model.last_kwargs["position_ids"].shape == (3, 2, 4)
+    assert pipeline.model.last_kwargs["vinputs"].shape == (2, 2, 3)
+    assert pipeline.model.last_kwargs["timestep"].shape == (2,)
+    assert pipeline.model.last_kwargs["attention_mask"].shape == (2, 1, 4, 4)
+    assert pipeline.model.last_kwargs["full_attn_spans"] == [
+        [(2, 4)],
+        [(2, 4)],
+    ]
+    assert cond_output.shape == (1, 2, 3)
+    assert uncond_output.shape == (1, 2, 3)

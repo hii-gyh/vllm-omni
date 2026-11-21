@@ -620,6 +620,81 @@ class HiDreamO1ImagePipeline(nn.Module, DiffusionPipelineProfilerMixin, Progress
         mask = sample["vinput_mask"][0]
         return outputs.x_pred[0, mask].unsqueeze(0)
 
+    @staticmethod
+    def _cfg_samples_can_batch(
+        cond_sample: HiDreamO1TextSample,
+        uncond_sample: HiDreamO1TextSample,
+    ) -> bool:
+        cond_input_ids = cond_sample["input_ids"]
+        uncond_input_ids = uncond_sample["input_ids"]
+        if cond_input_ids.shape != uncond_input_ids.shape:
+            return False
+        if cond_sample["position_ids"].shape != uncond_sample["position_ids"].shape:
+            return False
+        if cond_sample["vinput_mask"].shape != uncond_sample["vinput_mask"].shape:
+            return False
+
+        cond_mask = cond_sample["attention_mask"]
+        uncond_mask = uncond_sample["attention_mask"]
+        if (cond_mask is None) != (uncond_mask is None):
+            return False
+        if cond_mask is not None and cond_mask.shape != uncond_mask.shape:
+            return False
+        return True
+
+    def _forward_cfg_batch(
+        self,
+        cond_sample: HiDreamO1TextSample,
+        uncond_sample: HiDreamO1TextSample,
+        z_in: torch.Tensor,
+        t_pixeldit: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if not self._cfg_samples_can_batch(cond_sample, uncond_sample):
+            raise ValueError("CFG samples must have identical sequence shapes")
+
+        input_ids = torch.cat(
+            [cond_sample["input_ids"], uncond_sample["input_ids"]],
+            dim=0,
+        )
+        position_ids = torch.cat(
+            [cond_sample["position_ids"], uncond_sample["position_ids"]],
+            dim=1,
+        )
+        vinputs = z_in.repeat(2, 1, 1)
+        timestep = t_pixeldit.reshape(-1).repeat(2).to(self.device)
+
+        cond_mask = cond_sample["attention_mask"]
+        uncond_mask = uncond_sample["attention_mask"]
+        attention_mask = None
+        if cond_mask is not None:
+            attention_mask = torch.cat([cond_mask, uncond_mask], dim=0)
+
+        full_attn_spans = cond_sample["full_attn_spans"] + uncond_sample["full_attn_spans"]
+
+        with torch.autocast(self.device.type, dtype=self.dtype, cache_enabled=False):
+            outputs = self.model(
+                input_ids=input_ids,
+                position_ids=position_ids,
+                vinputs=vinputs,
+                timestep=timestep,
+                attention_mask=attention_mask,
+                full_attn_spans=full_attn_spans,
+            )
+
+        if outputs.x_pred is None:
+            raise RuntimeError("model returned x_pred=None")
+        if outputs.x_pred.shape[0] != 2:
+            raise RuntimeError(f"CFG batch must return batch size 2, got {outputs.x_pred.shape[0]}")
+        if outputs.x_pred.shape[-1] != z_in.shape[-1]:
+            raise RuntimeError(f"x_pred patch_dim {outputs.x_pred.shape[-1]} != z_in {z_in.shape[-1]}")
+
+        cond_mask = cond_sample["vinput_mask"][0]
+        uncond_mask = uncond_sample["vinput_mask"][0]
+        return (
+            outputs.x_pred[0, cond_mask].unsqueeze(0),
+            outputs.x_pred[1, uncond_mask].unsqueeze(0),
+        )
+
     def _build_and_validate_sample(
         self,
         prompt: str,
@@ -698,18 +773,27 @@ class HiDreamO1ImagePipeline(nn.Module, DiffusionPipelineProfilerMixin, Progress
                 t_pixeldit = 1.0 - step_t_f32 / 1000.0
                 sigma = (step_t_f32 / 1000.0).to(dtype=torch.float32).clamp_min(T_EPS)
 
-                x_pred_cond = self._forward_once(samples[0], z, t_pixeldit)
-                v_cond = (x_pred_cond.to(torch.float32) - z.to(torch.float32)) / sigma
-
                 if len(samples) > 1:
-                    x_pred_uncond = self._forward_once(
-                        samples[1],
-                        z,
-                        t_pixeldit,
-                    )
+                    if self._cfg_samples_can_batch(samples[0], samples[1]):
+                        x_pred_cond, x_pred_uncond = self._forward_cfg_batch(
+                            samples[0],
+                            samples[1],
+                            z,
+                            t_pixeldit,
+                        )
+                    else:
+                        x_pred_cond = self._forward_once(samples[0], z, t_pixeldit)
+                        x_pred_uncond = self._forward_once(
+                            samples[1],
+                            z,
+                            t_pixeldit,
+                        )
+                    v_cond = (x_pred_cond.to(torch.float32) - z.to(torch.float32)) / sigma
                     v_uncond = (x_pred_uncond.to(torch.float32) - z.to(torch.float32)) / sigma
                     v_guided = v_uncond + guidance_scale * (v_cond - v_uncond)
                 else:
+                    x_pred_cond = self._forward_once(samples[0], z, t_pixeldit)
+                    v_cond = (x_pred_cond.to(torch.float32) - z.to(torch.float32)) / sigma
                     v_guided = v_cond
 
                 model_output = -v_guided
