@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+from collections import OrderedDict
 from collections.abc import Iterable
 from typing import ClassVar, TypedDict
 
@@ -37,6 +38,15 @@ PATCH_SIZE = 32
 TIMESTEP_TOKEN_NUM = 1
 NOISE_SCALE = 8.0
 T_EPS = 0.001
+TEXT_SAMPLE_CACHE_CAPACITY = 128
+# Measured on H800 (bf16, flash-attn Sm90, interleaved e2e A/B, 50 steps):
+# batched CFG is bit-exact but NOT faster end-to-end. The sequential step is
+# GPU-bound (replaying both forwards from one CUDA graph is no faster either),
+# and the B=2 strided-batched GEMM/attention kernels cost more device time than
+# two B=1 calls; even an ideal homogeneous batch measures speedup 0.966
+# @2048x2048. The gate therefore defaults to 0 (sequential CFG); set it to a
+# positive image-token budget only after re-measuring on the target hardware.
+CFG_BATCH_MAX_IMAGE_TOKENS = 0
 
 # upstream: HiDream-O1-Image models/utils.py L7-19 @21bcd30471ac
 PREDEFINED_RESOLUTIONS: tuple[tuple[int, int], ...] = (
@@ -444,6 +454,9 @@ class HiDreamO1ImagePipeline(nn.Module, DiffusionPipelineProfilerMixin, Progress
         self.model_dir = od_config.model
         self.dtype = od_config.dtype if od_config.dtype is not None else torch.bfloat16
         self.device = get_local_device()
+        self._text_sample_cache: OrderedDict[tuple[object, ...], HiDreamO1TextSample] = OrderedDict()
+        self._text_sample_cache_hits = 0
+        self._text_sample_cache_misses = 0
         self.weights_sources = [
             DiffusersPipelineLoader.ComponentSource(
                 model_or_path=od_config.model,
@@ -620,6 +633,149 @@ class HiDreamO1ImagePipeline(nn.Module, DiffusionPipelineProfilerMixin, Progress
         mask = sample["vinput_mask"][0]
         return outputs.x_pred[0, mask].unsqueeze(0)
 
+    @staticmethod
+    def _cfg_samples_can_batch(
+        cond_sample: HiDreamO1TextSample,
+        uncond_sample: HiDreamO1TextSample,
+    ) -> bool:
+        # Text prefixes may differ in length: the shorter row is trailing-padded
+        # to the common sequence length and its pad columns stay outside every
+        # real row's attention range (per-row spans keep real boundaries).
+        # Image slot counts must match so both rows share the same vinput grid.
+        if cond_sample["vinput_mask"].sum() != uncond_sample["vinput_mask"].sum():
+            return False
+        if cond_sample["position_ids"].shape[:-1] != uncond_sample["position_ids"].shape[:-1]:
+            return False
+        if cond_sample["vinput_mask"].shape[:-1] != uncond_sample["vinput_mask"].shape[:-1]:
+            return False
+        cond_mask = cond_sample["attention_mask"]
+        uncond_mask = uncond_sample["attention_mask"]
+        if (cond_mask is None) != (uncond_mask is None):
+            return False
+        return True
+
+    @staticmethod
+    def _pad_cfg_sample(
+        sample: HiDreamO1TextSample,
+        target_seq_len: int,
+    ) -> HiDreamO1TextSample:
+        """Trailing-pad a sample so batched rows share one sequence length.
+
+        Pad tokens sit after the real suffix span, so no real query attends to
+        them (piecewise kv_end stays at the real span end; dense masks get
+        -inf pad rows/columns). Pad row outputs are discarded via vinput_mask.
+        """
+        seq_len = sample["position_ids"].shape[-1]
+        if seq_len == target_seq_len:
+            return sample
+        pad = target_seq_len - seq_len
+        device = sample["position_ids"].device
+        padded = dict(sample)
+        padded["input_ids"] = torch.cat(
+            [
+                sample["input_ids"],
+                torch.zeros((1, pad), dtype=sample["input_ids"].dtype, device=device),
+            ],
+            dim=-1,
+        )
+        padded["position_ids"] = torch.cat(
+            [
+                sample["position_ids"],
+                torch.zeros(
+                    sample["position_ids"].shape[:-1] + (pad,),
+                    dtype=sample["position_ids"].dtype,
+                    device=device,
+                ),
+            ],
+            dim=-1,
+        )
+        padded["vinput_mask"] = torch.cat(
+            [
+                sample["vinput_mask"],
+                torch.zeros((1, pad), dtype=sample["vinput_mask"].dtype, device=device),
+            ],
+            dim=-1,
+        )
+        mask = sample["attention_mask"]
+        if mask is not None:
+            new_mask = torch.full(
+                (1, 1, target_seq_len, target_seq_len),
+                torch.finfo(mask.dtype).min,
+                dtype=mask.dtype,
+                device=device,
+            )
+            new_mask[:, :, :seq_len, :seq_len] = mask
+            padded["attention_mask"] = new_mask
+        return padded
+
+    def _forward_cfg_batch(
+        self,
+        cond_sample: HiDreamO1TextSample,
+        uncond_sample: HiDreamO1TextSample,
+        z_in: torch.Tensor,
+        t_pixeldit: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if not self._cfg_samples_can_batch(cond_sample, uncond_sample):
+            raise ValueError("CFG samples must have identical image slot counts")
+
+        target_seq_len = max(
+            cond_sample["position_ids"].shape[-1],
+            uncond_sample["position_ids"].shape[-1],
+        )
+        cfg_text_lens = (
+            cond_sample["input_ids"].shape[-1],
+            uncond_sample["input_ids"].shape[-1],
+        )
+        cond_sample = self._pad_cfg_sample(cond_sample, target_seq_len)
+        uncond_sample = self._pad_cfg_sample(uncond_sample, target_seq_len)
+
+        input_ids = torch.cat(
+            [cond_sample["input_ids"], uncond_sample["input_ids"]],
+            dim=0,
+        )
+        position_ids = torch.cat(
+            [cond_sample["position_ids"], uncond_sample["position_ids"]],
+            dim=1,
+        )
+        vinputs = z_in.repeat(2, 1, 1)
+        timestep = t_pixeldit.reshape(-1).repeat(2).to(self.device)
+
+        cond_mask = cond_sample["attention_mask"]
+        uncond_mask = uncond_sample["attention_mask"]
+        attention_mask = None
+        if cond_mask is not None:
+            attention_mask = torch.cat([cond_mask, uncond_mask], dim=0)
+
+        # Per-row spans keep REAL boundaries so trailing pad columns are never
+        # attended by real queries; the transformer runs piecewise attention
+        # per row when spans are heterogeneous.
+        full_attn_spans = cond_sample["full_attn_spans"] + uncond_sample["full_attn_spans"]
+
+        with torch.autocast(self.device.type, dtype=self.dtype, cache_enabled=False):
+            outputs = self.model(
+                input_ids=input_ids,
+                position_ids=position_ids,
+                vinputs=vinputs,
+                timestep=timestep,
+                attention_mask=attention_mask,
+                full_attn_spans=full_attn_spans,
+                cfg_text_lens=cfg_text_lens,
+            )
+
+        if outputs.x_pred is None:
+            raise RuntimeError("model returned x_pred=None")
+        if outputs.x_pred.shape[0] != 2:
+            raise RuntimeError(f"CFG batch must return batch size 2, got {outputs.x_pred.shape[0]}")
+        if outputs.x_pred.shape[-1] != z_in.shape[-1]:
+            raise RuntimeError(f"x_pred patch_dim {outputs.x_pred.shape[-1]} != z_in {z_in.shape[-1]}")
+
+        cond_mask = cond_sample["vinput_mask"][0]
+        uncond_mask = uncond_sample["vinput_mask"][0]
+        return (
+            outputs.x_pred[0, cond_mask].unsqueeze(0),
+            outputs.x_pred[1, uncond_mask].unsqueeze(0),
+        )
+
     def _build_and_validate_sample(
         self,
         prompt: str,
@@ -627,6 +783,27 @@ class HiDreamO1ImagePipeline(nn.Module, DiffusionPipelineProfilerMixin, Progress
         width: int,
         expected_image_len: int,
     ) -> HiDreamO1TextSample:
+        cache_key = (
+            str(self.model_dir),
+            str(getattr(self.od_config, "revision", None)),
+            str(prompt),
+            int(height),
+            int(width),
+            int(expected_image_len),
+            str(self.dtype),
+            bool(self.model.supports_piecewise_attention),
+        )
+        cached = getattr(self, "_text_sample_cache", None)
+        if cached is not None:
+            try:
+                sample = cached.pop(cache_key)
+            except KeyError:
+                self._text_sample_cache_misses += 1
+            else:
+                cached[cache_key] = sample
+                self._text_sample_cache_hits += 1
+                return sample
+
         sample = build_t2i_text_sample(
             prompt=prompt,
             height=height,
@@ -648,12 +825,26 @@ class HiDreamO1ImagePipeline(nn.Module, DiffusionPipelineProfilerMixin, Progress
                 inputs["token_types"],
                 dtype=self.dtype,
             )
-        return {
+        text_sample: HiDreamO1TextSample = {
             "input_ids": inputs["input_ids"],
             "position_ids": inputs["position_ids"],
             "attention_mask": attention_mask,
             "full_attn_spans": full_attn_spans,
             "vinput_mask": inputs["vinput_mask"],
+        }
+        if cached is not None:
+            cached[cache_key] = text_sample
+            while len(cached) > TEXT_SAMPLE_CACHE_CAPACITY:
+                cached.popitem(last=False)
+        return text_sample
+
+    def get_text_sample_cache_stats(self) -> dict[str, int]:
+        cached = getattr(self, "_text_sample_cache", None)
+        return {
+            "hits": int(getattr(self, "_text_sample_cache_hits", 0)),
+            "misses": int(getattr(self, "_text_sample_cache_misses", 0)),
+            "entries": len(cached) if cached is not None else 0,
+            "capacity": TEXT_SAMPLE_CACHE_CAPACITY,
         }
 
     @torch.inference_mode()
@@ -698,18 +889,29 @@ class HiDreamO1ImagePipeline(nn.Module, DiffusionPipelineProfilerMixin, Progress
                 t_pixeldit = 1.0 - step_t_f32 / 1000.0
                 sigma = (step_t_f32 / 1000.0).to(dtype=torch.float32).clamp_min(T_EPS)
 
-                x_pred_cond = self._forward_once(samples[0], z, t_pixeldit)
-                v_cond = (x_pred_cond.to(torch.float32) - z.to(torch.float32)) / sigma
-
                 if len(samples) > 1:
-                    x_pred_uncond = self._forward_once(
-                        samples[1],
-                        z,
-                        t_pixeldit,
-                    )
+                    if expected_image_len <= CFG_BATCH_MAX_IMAGE_TOKENS and self._cfg_samples_can_batch(
+                        samples[0], samples[1]
+                    ):
+                        x_pred_cond, x_pred_uncond = self._forward_cfg_batch(
+                            samples[0],
+                            samples[1],
+                            z,
+                            t_pixeldit,
+                        )
+                    else:
+                        x_pred_cond = self._forward_once(samples[0], z, t_pixeldit)
+                        x_pred_uncond = self._forward_once(
+                            samples[1],
+                            z,
+                            t_pixeldit,
+                        )
+                    v_cond = (x_pred_cond.to(torch.float32) - z.to(torch.float32)) / sigma
                     v_uncond = (x_pred_uncond.to(torch.float32) - z.to(torch.float32)) / sigma
                     v_guided = v_uncond + guidance_scale * (v_cond - v_uncond)
                 else:
+                    x_pred_cond = self._forward_once(samples[0], z, t_pixeldit)
+                    v_cond = (x_pred_cond.to(torch.float32) - z.to(torch.float32)) / sigma
                     v_guided = v_cond
 
                 model_output = -v_guided
