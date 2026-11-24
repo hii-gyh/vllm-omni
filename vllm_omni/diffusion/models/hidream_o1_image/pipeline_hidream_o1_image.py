@@ -39,6 +39,14 @@ TIMESTEP_TOKEN_NUM = 1
 NOISE_SCALE = 8.0
 T_EPS = 0.001
 TEXT_SAMPLE_CACHE_CAPACITY = 128
+# Measured on H800 (bf16, flash-attn Sm90, interleaved e2e A/B, 50 steps):
+# batched CFG is bit-exact but NOT faster end-to-end. The sequential step is
+# GPU-bound (replaying both forwards from one CUDA graph is no faster either),
+# and the B=2 strided-batched GEMM/attention kernels cost more device time than
+# two B=1 calls; even an ideal homogeneous batch measures speedup 0.966
+# @2048x2048. The gate therefore defaults to 0 (sequential CFG); set it to a
+# positive image-token budget only after re-measuring on the target hardware.
+CFG_BATCH_MAX_IMAGE_TOKENS = 0
 
 # upstream: HiDream-O1-Image models/utils.py L7-19 @21bcd30471ac
 PREDEFINED_RESOLUTIONS: tuple[tuple[int, int], ...] = (
@@ -630,22 +638,75 @@ class HiDreamO1ImagePipeline(nn.Module, DiffusionPipelineProfilerMixin, Progress
         cond_sample: HiDreamO1TextSample,
         uncond_sample: HiDreamO1TextSample,
     ) -> bool:
-        cond_input_ids = cond_sample["input_ids"]
-        uncond_input_ids = uncond_sample["input_ids"]
-        if cond_input_ids.shape != uncond_input_ids.shape:
+        # Text prefixes may differ in length: the shorter row is trailing-padded
+        # to the common sequence length and its pad columns stay outside every
+        # real row's attention range (per-row spans keep real boundaries).
+        # Image slot counts must match so both rows share the same vinput grid.
+        if cond_sample["vinput_mask"].sum() != uncond_sample["vinput_mask"].sum():
             return False
-        if cond_sample["position_ids"].shape != uncond_sample["position_ids"].shape:
+        if cond_sample["position_ids"].shape[:-1] != uncond_sample["position_ids"].shape[:-1]:
             return False
-        if cond_sample["vinput_mask"].shape != uncond_sample["vinput_mask"].shape:
+        if cond_sample["vinput_mask"].shape[:-1] != uncond_sample["vinput_mask"].shape[:-1]:
             return False
-
         cond_mask = cond_sample["attention_mask"]
         uncond_mask = uncond_sample["attention_mask"]
         if (cond_mask is None) != (uncond_mask is None):
             return False
-        if cond_mask is not None and cond_mask.shape != uncond_mask.shape:
-            return False
         return True
+
+    @staticmethod
+    def _pad_cfg_sample(
+        sample: HiDreamO1TextSample,
+        target_seq_len: int,
+    ) -> HiDreamO1TextSample:
+        """Trailing-pad a sample so batched rows share one sequence length.
+
+        Pad tokens sit after the real suffix span, so no real query attends to
+        them (piecewise kv_end stays at the real span end; dense masks get
+        -inf pad rows/columns). Pad row outputs are discarded via vinput_mask.
+        """
+        seq_len = sample["position_ids"].shape[-1]
+        if seq_len == target_seq_len:
+            return sample
+        pad = target_seq_len - seq_len
+        device = sample["position_ids"].device
+        padded = dict(sample)
+        padded["input_ids"] = torch.cat(
+            [
+                sample["input_ids"],
+                torch.zeros((1, pad), dtype=sample["input_ids"].dtype, device=device),
+            ],
+            dim=-1,
+        )
+        padded["position_ids"] = torch.cat(
+            [
+                sample["position_ids"],
+                torch.zeros(
+                    sample["position_ids"].shape[:-1] + (pad,),
+                    dtype=sample["position_ids"].dtype,
+                    device=device,
+                ),
+            ],
+            dim=-1,
+        )
+        padded["vinput_mask"] = torch.cat(
+            [
+                sample["vinput_mask"],
+                torch.zeros((1, pad), dtype=sample["vinput_mask"].dtype, device=device),
+            ],
+            dim=-1,
+        )
+        mask = sample["attention_mask"]
+        if mask is not None:
+            new_mask = torch.full(
+                (1, 1, target_seq_len, target_seq_len),
+                torch.finfo(mask.dtype).min,
+                dtype=mask.dtype,
+                device=device,
+            )
+            new_mask[:, :, :seq_len, :seq_len] = mask
+            padded["attention_mask"] = new_mask
+        return padded
 
     def _forward_cfg_batch(
         self,
@@ -655,7 +716,18 @@ class HiDreamO1ImagePipeline(nn.Module, DiffusionPipelineProfilerMixin, Progress
         t_pixeldit: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         if not self._cfg_samples_can_batch(cond_sample, uncond_sample):
-            raise ValueError("CFG samples must have identical sequence shapes")
+            raise ValueError("CFG samples must have identical image slot counts")
+
+        target_seq_len = max(
+            cond_sample["position_ids"].shape[-1],
+            uncond_sample["position_ids"].shape[-1],
+        )
+        cfg_text_lens = (
+            cond_sample["input_ids"].shape[-1],
+            uncond_sample["input_ids"].shape[-1],
+        )
+        cond_sample = self._pad_cfg_sample(cond_sample, target_seq_len)
+        uncond_sample = self._pad_cfg_sample(uncond_sample, target_seq_len)
 
         input_ids = torch.cat(
             [cond_sample["input_ids"], uncond_sample["input_ids"]],
@@ -674,6 +746,9 @@ class HiDreamO1ImagePipeline(nn.Module, DiffusionPipelineProfilerMixin, Progress
         if cond_mask is not None:
             attention_mask = torch.cat([cond_mask, uncond_mask], dim=0)
 
+        # Per-row spans keep REAL boundaries so trailing pad columns are never
+        # attended by real queries; the transformer runs piecewise attention
+        # per row when spans are heterogeneous.
         full_attn_spans = cond_sample["full_attn_spans"] + uncond_sample["full_attn_spans"]
 
         with torch.autocast(self.device.type, dtype=self.dtype, cache_enabled=False):
@@ -684,6 +759,7 @@ class HiDreamO1ImagePipeline(nn.Module, DiffusionPipelineProfilerMixin, Progress
                 timestep=timestep,
                 attention_mask=attention_mask,
                 full_attn_spans=full_attn_spans,
+                cfg_text_lens=cfg_text_lens,
             )
 
         if outputs.x_pred is None:
@@ -814,7 +890,9 @@ class HiDreamO1ImagePipeline(nn.Module, DiffusionPipelineProfilerMixin, Progress
                 sigma = (step_t_f32 / 1000.0).to(dtype=torch.float32).clamp_min(T_EPS)
 
                 if len(samples) > 1:
-                    if self._cfg_samples_can_batch(samples[0], samples[1]):
+                    if expected_image_len <= CFG_BATCH_MAX_IMAGE_TOKENS and self._cfg_samples_can_batch(
+                        samples[0], samples[1]
+                    ):
                         x_pred_cond, x_pred_uncond = self._forward_cfg_batch(
                             samples[0],
                             samples[1],

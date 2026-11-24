@@ -145,6 +145,78 @@ def test_hidream_cfg_batch_runs_one_forward_and_splits_outputs():
     assert uncond_output.shape == (1, 2, 3)
 
 
+def test_hidream_cfg_samples_can_batch_with_different_text_lengths():
+    cond_sample = _cfg_sample()
+    shorter = _cfg_sample(seq_len=3)
+    shorter["input_ids"] = torch.zeros((1, 1), dtype=torch.long)
+    shorter["position_ids"] = torch.zeros((3, 1, 3), dtype=torch.long)
+    shorter["attention_mask"] = torch.zeros((1, 1, 3, 3), dtype=torch.float32)
+    shorter["full_attn_spans"] = [[(1, 3)]]
+    shorter["vinput_mask"] = torch.tensor([[False, True, True]])
+    assert HiDreamO1ImagePipeline._cfg_samples_can_batch(cond_sample, shorter)
+
+    other_images = _cfg_sample(seq_len=5)
+    other_images["vinput_mask"] = torch.tensor([[False, False, True, True, True]])
+    assert not HiDreamO1ImagePipeline._cfg_samples_can_batch(cond_sample, other_images)
+
+
+def test_hidream_pad_cfg_sample_keeps_real_spans_and_masks_pad():
+    sample = _cfg_sample(seq_len=3)
+    sample["input_ids"] = torch.zeros((1, 1), dtype=torch.long)
+    sample["position_ids"] = torch.zeros((3, 1, 3), dtype=torch.long)
+    sample["attention_mask"] = torch.zeros((1, 1, 3, 3), dtype=torch.float32)
+    sample["full_attn_spans"] = [[(1, 3)]]
+    sample["vinput_mask"] = torch.tensor([[False, True, True]])
+
+    padded = HiDreamO1ImagePipeline._pad_cfg_sample(sample, 4)
+    assert padded["input_ids"].shape == (1, 2)
+    assert padded["position_ids"].shape == (3, 1, 4)
+    assert padded["vinput_mask"].tolist() == [[False, True, True, False]]
+    assert padded["full_attn_spans"] == [[(1, 3)]]
+    assert padded["attention_mask"].shape == (1, 1, 4, 4)
+    assert (padded["attention_mask"][0, 0, 3, :] == torch.finfo(torch.float32).min).all()
+    assert (padded["attention_mask"][0, 0, :, 3] == torch.finfo(torch.float32).min).all()
+    assert (padded["attention_mask"][0, 0, :3, :3] == 0).all()
+    assert HiDreamO1ImagePipeline._pad_cfg_sample(padded, 4) is padded
+
+
+def test_hidream_cfg_batch_pads_heterogeneous_rows_and_keeps_per_row_spans():
+    pipeline = HiDreamO1ImagePipeline.__new__(HiDreamO1ImagePipeline)
+    pipeline.device = torch.device("cpu")
+    pipeline.dtype = torch.float32
+    pipeline.model = _MockImageModel()
+
+    cond_sample = _cfg_sample()
+    shorter = _cfg_sample(seq_len=3)
+    shorter["input_ids"] = torch.zeros((1, 1), dtype=torch.long)
+    shorter["position_ids"] = torch.zeros((3, 1, 3), dtype=torch.long)
+    shorter["attention_mask"] = torch.zeros((1, 1, 3, 3), dtype=torch.float32)
+    shorter["full_attn_spans"] = [[(1, 3)]]
+    shorter["vinput_mask"] = torch.tensor([[False, True, True]])
+
+    z_in = torch.zeros((1, 2, 3), dtype=torch.float32)
+    timestep = torch.tensor([0.25], dtype=torch.float32)
+    cond_output, uncond_output = pipeline._forward_cfg_batch(cond_sample, shorter, z_in, timestep)
+
+    assert pipeline.model.call_count == 1
+    assert pipeline.model.last_kwargs["input_ids"].shape == (2, 2)
+    assert pipeline.model.last_kwargs["position_ids"].shape == (3, 2, 4)
+    assert pipeline.model.last_kwargs["full_attn_spans"] == [[(2, 4)], [(1, 3)]]
+    assert pipeline.model.last_kwargs["cfg_text_lens"] == (2, 1)
+    assert cond_output.shape == (1, 2, 3)
+    assert uncond_output.shape == (1, 2, 3)
+
+
+def test_hidream_cfg_batch_gate_defaults_off_after_h800_measurement():
+    # Interleaved e2e A/B on H800 measured speedup < 1 for batched CFG at every
+    # bucket (even an ideal homogeneous batch), so the dispatch gate ships off.
+    from vllm_omni.diffusion.models.hidream_o1_image import (
+        pipeline_hidream_o1_image as module,
+    )
+
+    assert module.CFG_BATCH_MAX_IMAGE_TOKENS == 0
+
+
 def test_hidream_text_sample_cache_reuses_matching_static_sample():
     pipeline = HiDreamO1ImagePipeline.__new__(HiDreamO1ImagePipeline)
     pipeline.od_config = SimpleNamespace(revision="test-revision")
@@ -169,8 +241,6 @@ def test_hidream_text_sample_cache_reuses_matching_static_sample():
         return {
             "input_ids": torch.zeros((1, 2), dtype=torch.long),
             "position_ids": torch.zeros((3, 1, 4), dtype=torch.long),
-            "attention_mask": None,
-            "full_attn_spans": [[(2, 4)]],
             "vinput_mask": torch.tensor([[False, False, True, True]]),
             "token_types": torch.tensor([[0, 0, 1, 1]]),
         }
@@ -189,13 +259,13 @@ def test_hidream_text_sample_cache_reuses_matching_static_sample():
             "same prompt",
             64,
             64,
-            4,
+            2,
         )
         second = pipeline._build_and_validate_sample(
             "same prompt",
             64,
             64,
-            4,
+            2,
         )
 
     assert first is second

@@ -181,15 +181,47 @@ class HiDreamO1Attention(nn.Module):
         key = key.transpose(1, 2)
         value = value.transpose(1, 2)
 
-        attn_output = self.attn(
-            query,
-            key,
-            value,
-            AttentionMetadata(
-                attn_mask=attention_mask,
-                full_attn_spans=full_attn_spans,
-            ),
-        )
+        if (
+            full_attn_spans is not None
+            and batch_size > 1
+            and any(spans != full_attn_spans[0] for spans in full_attn_spans[1:])
+        ):
+            # Heterogeneous rows (e.g. trailing-padded CFG batch): run piecewise
+            # attention per row over its REAL length so pad columns are never
+            # attended; numerically identical to the sequential CFG path.
+            rows = []
+            for i in range(batch_size):
+                real_len = max(end for _, end in full_attn_spans[i])
+                row_mask = None if attention_mask is None else attention_mask[i : i + 1, :, :real_len, :real_len]
+                row_out = self.attn(
+                    query[i : i + 1, :real_len],
+                    key[i : i + 1, :real_len],
+                    value[i : i + 1, :real_len],
+                    AttentionMetadata(
+                        attn_mask=row_mask,
+                        full_attn_spans=[full_attn_spans[i]],
+                    ),
+                )
+                if real_len < seq_len:
+                    row_out = torch.cat(
+                        [
+                            row_out,
+                            row_out.new_zeros(1, seq_len - real_len, *row_out.shape[2:]),
+                        ],
+                        dim=1,
+                    )
+                rows.append(row_out)
+            attn_output = torch.cat(rows, dim=0)
+        else:
+            attn_output = self.attn(
+                query,
+                key,
+                value,
+                AttentionMetadata(
+                    attn_mask=attention_mask,
+                    full_attn_spans=full_attn_spans,
+                ),
+            )
         attn_output = attn_output.reshape(batch_size, seq_len, q_size)
         attn_output, _ = self.o_proj(attn_output)
         return attn_output
@@ -456,6 +488,7 @@ class HiDreamO1ImageModel(nn.Module):
         timestep: torch.Tensor,
         attention_mask: torch.Tensor | None,
         full_attn_spans: list[list[tuple[int, int]]] | None,
+        cfg_text_lens: tuple[int, ...] | None = None,
     ) -> HiDreamO1ImageOutput:
         inputs_embeds = self.language_model.embed_tokens(input_ids)
         timestep_embeds = self.t_embedder1(timestep.to(inputs_embeds.device))
@@ -468,6 +501,23 @@ class HiDreamO1ImageModel(nn.Module):
 
         image_embeds = self.x_embedder(vinputs.to(inputs_embeds.device)).to(inputs_embeds.dtype)
         inputs_embeds = torch.cat([inputs_embeds, image_embeds], dim=1)
+        if cfg_text_lens is not None:
+            # Trailing-padded CFG rows arrive as [text][pad][image] because
+            # image embeds are appended after input_ids; move the pad block
+            # behind the image so coordinates match position_ids/spans/mask
+            # ([text][image][pad]). Real token embeddings are untouched.
+            image_len = vinputs.shape[1]
+            rows = []
+            for i, text_len in enumerate(cfg_text_lens):
+                pad_len = inputs_embeds.shape[1] - text_len - image_len
+                row = inputs_embeds[i]
+                if pad_len > 0:
+                    row = torch.cat(
+                        [row[:text_len], row[text_len + pad_len :], row[text_len : text_len + pad_len]],
+                        dim=0,
+                    )
+                rows.append(row)
+            inputs_embeds = torch.stack(rows, dim=0)
         batch_size, total_seq_len, _ = inputs_embeds.shape
 
         if attention_mask is not None:
@@ -526,6 +576,7 @@ class HiDreamO1ImageTransformer(nn.Module):
         timestep: torch.Tensor,
         attention_mask: torch.Tensor | None,
         full_attn_spans: list[list[tuple[int, int]]] | None = None,
+        cfg_text_lens: tuple[int, ...] | None = None,
         **_: object,
     ) -> HiDreamO1ImageOutput:
         return self.model(
@@ -535,6 +586,7 @@ class HiDreamO1ImageTransformer(nn.Module):
             timestep=timestep,
             attention_mask=attention_mask,
             full_attn_spans=full_attn_spans,
+            cfg_text_lens=cfg_text_lens,
         )
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
