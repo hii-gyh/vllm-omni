@@ -22,6 +22,7 @@ from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
 from vllm_omni.diffusion.models.hidream_o1_image.hidream_o1_image_transformer import (
     HiDreamO1ImageTransformer,
+    HiDreamO1PrefixKVCache,
 )
 from vllm_omni.diffusion.models.progress_bar import ProgressBarMixin
 from vllm_omni.diffusion.models.schedulers import FlowUniPCMultistepScheduler
@@ -47,6 +48,17 @@ TEXT_SAMPLE_CACHE_CAPACITY = 128
 # @2048x2048. The gate therefore defaults to 0 (sequential CFG); set it to a
 # positive image-token budget only after re-measuring on the target hardware.
 CFG_BATCH_MAX_IMAGE_TOKENS = 0
+# Measured on H800 (bf16, FlashAttention-3 piecewise, interleaved forward-level
+# A/B, 2048x2048): caching the causal text prefix K/V across denoising steps is
+# bit-exact (forward output and e2e pixels identical) but only pays for long
+# prompts. reuse/baseline forward time was 1.02 @31 text tokens (slower) and
+# 0.96 @297 tokens; a single cooled e2e pair @297 tokens went 25.8 s -> 25.3 s.
+# The prefix is ~0.05 ms per text token per forward while the K/V merge and the
+# shorter GEMMs cost a few ms, so the gate defaults to 0 (off): below the gate
+# no cache object is built and the hot path is unchanged. Text tokens exclude
+# the trailing ``tms``; the breakeven is ~100 tokens (extrapolated from that
+# slope, not measured). 128 is a reasonable first value to opt in with.
+PREFIX_KV_CACHE_MIN_TEXT_TOKENS = 0
 
 # upstream: HiDream-O1-Image models/utils.py L7-19 @21bcd30471ac
 PREDEFINED_RESOLUTIONS: tuple[tuple[int, int], ...] = (
@@ -609,12 +621,31 @@ class HiDreamO1ImagePipeline(nn.Module, DiffusionPipelineProfilerMixin, Progress
             p2=PATCH_SIZE,
         )
 
+    def _prefix_cache_for(self, sample: HiDreamO1TextSample) -> HiDreamO1PrefixKVCache | None:
+        """Per-request prefix K/V cache, or ``None`` when the prompt is under the gate.
+
+        Only the sequential (batch_size == 1) CFG path uses it; the cached rows
+        are the causal text prefix ``[0, T-1)`` that precedes ``tms``.
+        """
+        gate = PREFIX_KV_CACHE_MIN_TEXT_TOKENS
+        if gate <= 0 or sample["input_ids"].shape[0] != 1:
+            return None
+        text_tokens = int(sample["input_ids"].shape[1]) - TIMESTEP_TOKEN_NUM
+        if text_tokens < max(gate, 1):
+            return None
+        num_layers = len(self.model.model.language_model.layers)
+        return HiDreamO1PrefixKVCache(prefix_len=text_tokens, num_layers=num_layers)
+
     def _forward_once(
         self,
         sample: HiDreamO1TextSample,
         z_in: torch.Tensor,
         t_pixeldit: torch.Tensor,
+        prefix_cache: HiDreamO1PrefixKVCache | None = None,
     ) -> torch.Tensor:
+        # Read before the call: the fill step flips ``filled`` inside the model.
+        reuse = prefix_cache is not None and prefix_cache.filled
+        extra = {} if prefix_cache is None else {"prefix_cache": prefix_cache}
         with torch.autocast(self.device.type, dtype=self.dtype, cache_enabled=False):
             outputs = self.model(
                 input_ids=sample["input_ids"],
@@ -623,6 +654,7 @@ class HiDreamO1ImagePipeline(nn.Module, DiffusionPipelineProfilerMixin, Progress
                 timestep=t_pixeldit.reshape(-1).to(self.device),
                 attention_mask=sample["attention_mask"],
                 full_attn_spans=sample["full_attn_spans"],
+                **extra,
             )
 
         if outputs.x_pred is None:
@@ -631,6 +663,11 @@ class HiDreamO1ImagePipeline(nn.Module, DiffusionPipelineProfilerMixin, Progress
             raise RuntimeError(f"x_pred patch_dim {outputs.x_pred.shape[-1]} != z_in {z_in.shape[-1]}")
 
         mask = sample["vinput_mask"][0]
+        if reuse:
+            # A reuse step returns only rows [prefix_len, S) = tms + image.
+            mask = mask[prefix_cache.prefix_len :]
+        if outputs.x_pred.shape[1] != mask.shape[0]:
+            raise RuntimeError(f"x_pred has {outputs.x_pred.shape[1]} rows but {mask.shape[0]} are selected")
         return outputs.x_pred[0, mask].unsqueeze(0)
 
     @staticmethod
@@ -867,6 +904,7 @@ class HiDreamO1ImagePipeline(nn.Module, DiffusionPipelineProfilerMixin, Progress
                 expected_image_len,
             )
             samples.append(uncond_sample)
+        prefix_caches = [self._prefix_cache_for(sample) for sample in samples]
 
         z = self._prepare_noise_and_patchify(
             height,
@@ -900,17 +938,13 @@ class HiDreamO1ImagePipeline(nn.Module, DiffusionPipelineProfilerMixin, Progress
                             t_pixeldit,
                         )
                     else:
-                        x_pred_cond = self._forward_once(samples[0], z, t_pixeldit)
-                        x_pred_uncond = self._forward_once(
-                            samples[1],
-                            z,
-                            t_pixeldit,
-                        )
+                        x_pred_cond = self._forward_once(samples[0], z, t_pixeldit, prefix_caches[0])
+                        x_pred_uncond = self._forward_once(samples[1], z, t_pixeldit, prefix_caches[1])
                     v_cond = (x_pred_cond.to(torch.float32) - z.to(torch.float32)) / sigma
                     v_uncond = (x_pred_uncond.to(torch.float32) - z.to(torch.float32)) / sigma
                     v_guided = v_uncond + guidance_scale * (v_cond - v_uncond)
                 else:
-                    x_pred_cond = self._forward_once(samples[0], z, t_pixeldit)
+                    x_pred_cond = self._forward_once(samples[0], z, t_pixeldit, prefix_caches[0])
                     v_cond = (x_pred_cond.to(torch.float32) - z.to(torch.float32)) / sigma
                     v_guided = v_cond
 

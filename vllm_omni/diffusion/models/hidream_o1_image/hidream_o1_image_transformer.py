@@ -19,7 +19,7 @@ from __future__ import annotations
 
 import math
 from collections.abc import Iterable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
 import torch
@@ -47,6 +47,67 @@ if TYPE_CHECKING:
 
 def _prefix(parent: str, child: str) -> str:
     return f"{parent}.{child}" if parent else child
+
+
+@dataclass
+class HiDreamO1PrefixKVCache:
+    """Cross-step K/V cache of the causal text prefix of one sample.
+
+    Rows ``[0, prefix_len)`` are causal and depend only on the text tokens and
+    their positions: the timestep travels on ``tms``, which sits in the full
+    span, so post-RoPE K/V of the prefix rows is identical on every denoising
+    step. The first forward fills the cache; each later forward runs only rows
+    ``[prefix_len, S)`` (``tms`` + image) against ``K/V = cache ++ fresh`` and
+    returns ``S - prefix_len`` rows. Numerically identical to the full forward.
+    """
+
+    prefix_len: int
+    num_layers: int
+    keys: list[torch.Tensor | None] = field(default_factory=list)
+    values: list[torch.Tensor | None] = field(default_factory=list)
+    filled: bool = False
+
+    def __post_init__(self) -> None:
+        self.keys = [None] * self.num_layers
+        self.values = [None] * self.num_layers
+
+
+def merge_prefix_kv(prefix: torch.Tensor, current: torch.Tensor) -> torch.Tensor:
+    """Place cached prefix rows ``[1, P, H, D]`` ahead of ``[1, L, H, D]``.
+
+    Two contiguous ``copy_`` into a fresh buffer measure ~0.018 ms vs ~0.028 ms
+    for ``torch.cat`` at the 2048x2048 shape (H800), and run twice per layer.
+    """
+    prefix_len = prefix.shape[1]
+    merged = torch.empty(
+        current.shape[0],
+        prefix_len + current.shape[1],
+        *current.shape[2:],
+        dtype=current.dtype,
+        device=current.device,
+    )
+    merged[:, :prefix_len] = prefix
+    merged[:, prefix_len:] = current
+    return merged
+
+
+def validate_prefix_kv_cache(
+    prefix_cache: HiDreamO1PrefixKVCache,
+    batch_size: int,
+    total_seq_len: int,
+    full_attn_spans: list[list[tuple[int, int]]] | None,
+) -> None:
+    """Reject layouts the prefix cache cannot serve (fail loudly, never silently)."""
+    if batch_size != 1:
+        raise ValueError(f"HiDream-O1 prefix KV cache requires batch_size == 1, got {batch_size}")
+    prefix_len = prefix_cache.prefix_len
+    if not 0 < prefix_len < total_seq_len:
+        raise ValueError(f"HiDream-O1 prefix KV cache prefix_len={prefix_len} must be in (0, {total_seq_len})")
+    if full_attn_spans is None or len(full_attn_spans) != 1:
+        raise ValueError("HiDream-O1 prefix KV cache requires exactly one full_attn_spans entry")
+    spans = full_attn_spans[0]
+    if not spans or spans[0][0] != prefix_len:
+        raise ValueError(f"HiDream-O1 prefix KV cache prefix_len={prefix_len} does not start at the full span {spans}")
 
 
 def _rotate_half(x: torch.Tensor) -> torch.Tensor:
@@ -164,6 +225,8 @@ class HiDreamO1Attention(nn.Module):
         position_embeddings: tuple[torch.Tensor, torch.Tensor],
         attention_mask: torch.Tensor | None,
         full_attn_spans: list[list[tuple[int, int]]] | None,
+        prefix_cache: HiDreamO1PrefixKVCache | None = None,
+        layer_idx: int = 0,
     ) -> torch.Tensor:
         batch_size, seq_len, _ = hidden_states.shape
         qkv, _ = self.qkv_proj(hidden_states)
@@ -180,6 +243,23 @@ class HiDreamO1Attention(nn.Module):
         query = query.transpose(1, 2)
         key = key.transpose(1, 2)
         value = value.transpose(1, 2)
+
+        if prefix_cache is not None:
+            # hidden_states holds either the whole sequence (fill step) or only
+            # rows [prefix_len, S) (reuse steps); see HiDreamO1PrefixKVCache.
+            if batch_size != 1:
+                raise ValueError(f"HiDream-O1 prefix KV cache requires batch_size == 1, got {batch_size}")
+            if prefix_cache.filled:
+                # One unmasked full call over K/V = cached prefix ++ fresh suffix;
+                # the query range is [prefix_len, S) in the sample's coordinates.
+                key = merge_prefix_kv(prefix_cache.keys[layer_idx], key)
+                value = merge_prefix_kv(prefix_cache.values[layer_idx], value)
+                if attention_mask is not None:
+                    attention_mask = attention_mask[:, :, prefix_cache.prefix_len :, :]
+                full_attn_spans = [[(prefix_cache.prefix_len, prefix_cache.prefix_len + seq_len)]]
+            else:
+                prefix_cache.keys[layer_idx] = key[:, : prefix_cache.prefix_len].contiguous()
+                prefix_cache.values[layer_idx] = value[:, : prefix_cache.prefix_len].contiguous()
 
         if (
             full_attn_spans is not None
@@ -257,6 +337,8 @@ class HiDreamO1DecoderLayer(nn.Module):
         position_embeddings: tuple[torch.Tensor, torch.Tensor],
         attention_mask: torch.Tensor | None,
         full_attn_spans: list[list[tuple[int, int]]] | None,
+        prefix_cache: HiDreamO1PrefixKVCache | None = None,
+        layer_idx: int = 0,
     ) -> torch.Tensor:
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
@@ -265,6 +347,8 @@ class HiDreamO1DecoderLayer(nn.Module):
             position_embeddings,
             attention_mask,
             full_attn_spans,
+            prefix_cache=prefix_cache,
+            layer_idx=layer_idx,
         )
         hidden_states = residual + hidden_states
 
@@ -313,16 +397,39 @@ class HiDreamO1TextModel(nn.Module):
         position_ids: torch.Tensor,
         attention_mask: torch.Tensor | None,
         full_attn_spans: list[list[tuple[int, int]]] | None,
+        prefix_cache: HiDreamO1PrefixKVCache | None = None,
     ) -> torch.Tensor:
         position_embeddings = self.rotary_emb(inputs_embeds, position_ids)
+        if prefix_cache is not None and prefix_cache.filled:
+            # Reuse step: carry only rows [prefix_len, S). cos/sin are (B, S, D).
+            prefix_len = prefix_cache.prefix_len
+            hidden_states = inputs_embeds[:, prefix_len:]
+            position_embeddings = (position_embeddings[0][:, prefix_len:], position_embeddings[1][:, prefix_len:])
+            if attention_mask is not None:
+                attention_mask = attention_mask[:, :, prefix_len:, :]
+            for layer_idx, layer in enumerate(self.layers):
+                hidden_states = layer(
+                    hidden_states,
+                    position_embeddings=position_embeddings,
+                    attention_mask=attention_mask,
+                    full_attn_spans=None,
+                    prefix_cache=prefix_cache,
+                    layer_idx=layer_idx,
+                )
+            return self.norm(hidden_states)
+
         hidden_states = inputs_embeds
-        for layer in self.layers:
+        for layer_idx, layer in enumerate(self.layers):
+            layer_kwargs = {} if prefix_cache is None else {"prefix_cache": prefix_cache, "layer_idx": layer_idx}
             hidden_states = layer(
                 hidden_states,
                 position_embeddings=position_embeddings,
                 attention_mask=attention_mask,
                 full_attn_spans=full_attn_spans,
+                **layer_kwargs,
             )
+        if prefix_cache is not None:
+            prefix_cache.filled = True
         return self.norm(hidden_states)
 
 
@@ -489,6 +596,7 @@ class HiDreamO1ImageModel(nn.Module):
         attention_mask: torch.Tensor | None,
         full_attn_spans: list[list[tuple[int, int]]] | None,
         cfg_text_lens: tuple[int, ...] | None = None,
+        prefix_cache: HiDreamO1PrefixKVCache | None = None,
     ) -> HiDreamO1ImageOutput:
         inputs_embeds = self.language_model.embed_tokens(input_ids)
         timestep_embeds = self.t_embedder1(timestep.to(inputs_embeds.device))
@@ -536,11 +644,15 @@ class HiDreamO1ImageModel(nn.Module):
                 f"for batch_size={batch_size}"
             )
 
+        if prefix_cache is not None:
+            validate_prefix_kv_cache(prefix_cache, batch_size, total_seq_len, full_attn_spans)
+
         hidden_states = self.language_model(
             inputs_embeds,
             position_ids,
             attention_mask,
             full_attn_spans,
+            prefix_cache=prefix_cache,
         )
         return HiDreamO1ImageOutput(x_pred=self.final_layer2(hidden_states))
 
@@ -577,8 +689,11 @@ class HiDreamO1ImageTransformer(nn.Module):
         attention_mask: torch.Tensor | None,
         full_attn_spans: list[list[tuple[int, int]]] | None = None,
         cfg_text_lens: tuple[int, ...] | None = None,
+        prefix_cache: HiDreamO1PrefixKVCache | None = None,
         **_: object,
     ) -> HiDreamO1ImageOutput:
+        # ``prefix_cache`` must be named here: the ``**_`` catch-all would
+        # otherwise swallow it and silently disable the cache.
         return self.model(
             input_ids=input_ids,
             position_ids=position_ids,
@@ -587,6 +702,7 @@ class HiDreamO1ImageTransformer(nn.Module):
             attention_mask=attention_mask,
             full_attn_spans=full_attn_spans,
             cfg_text_lens=cfg_text_lens,
+            prefix_cache=prefix_cache,
         )
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
