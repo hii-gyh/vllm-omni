@@ -49,15 +49,22 @@ TEXT_SAMPLE_CACHE_CAPACITY = 128
 # positive image-token budget only after re-measuring on the target hardware.
 CFG_BATCH_MAX_IMAGE_TOKENS = 0
 # Measured on H800 (bf16, FlashAttention-3 piecewise, interleaved forward-level
-# A/B, 2048x2048): caching the causal text prefix K/V across denoising steps is
-# bit-exact (forward output and e2e pixels identical) but only pays for long
-# prompts. reuse/baseline forward time was 1.02 @31 text tokens (slower) and
-# 0.96 @297 tokens; a single cooled e2e pair @297 tokens went 25.8 s -> 25.3 s.
-# The prefix is ~0.05 ms per text token per forward while the K/V merge and the
-# shorter GEMMs cost a few ms, so the gate defaults to 0 (off): below the gate
-# no cache object is built and the hot path is unchanged. Text tokens exclude
-# the trailing ``tms``; the breakeven is ~100 tokens (extrapolated from that
-# slope, not measured). 128 is a reasonable first value to opt in with.
+# A/B, 50 steps): caching the causal text prefix K/V across denoising steps is
+# bit-exact (forward output and e2e pixels identical). The saving is set by the
+# text share of the sequence: reuse/baseline forward time is ~1 - 0.85 * P/S at
+# 2048x2048 and ~1 - 1.0 * P/S at 1024x1024 (P = text tokens, S = total tokens).
+# Cooled forward-level ratios: 1.00 @31, 0.935 @297 and 0.82 @1030 text tokens
+# at 2048x2048; 0.96 @31 and 0.84 @297 at 1024x1024. Throttled sweeps follow the
+# same line, so the ratios carry over between clock states. A cooled e2e pair
+# @297 tokens went 25.8 s -> 25.3 s (+-2%): only the conditional branch has a
+# long prefix, so e2e gains about a third of the forward-level gain. The K/V
+# merge costs ~1.5 ms per forward and is offset by the dropped per-layer causal
+# attention call, so there is no loss at short prompts, only no gain: below
+# ~100 text tokens at 2048x2048 the gain is under the run-to-run noise. The gate
+# therefore defaults to 0 (off): below the gate no cache object is built and the
+# hot path is unchanged. Text tokens exclude the trailing ``tms``. 128 is a
+# reasonable first value to opt in with for prompts of 150+ tokens or for
+# resolutions of 1024x1024 and below.
 PREFIX_KV_CACHE_MIN_TEXT_TOKENS = 0
 
 # upstream: HiDream-O1-Image models/utils.py L7-19 @21bcd30471ac
